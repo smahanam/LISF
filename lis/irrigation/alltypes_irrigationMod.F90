@@ -28,7 +28,7 @@ module alltypes_irrigationMod
   use LIS_coreMod
   use LIS_logMod
   use LIS_irrigationMod
-
+  
   implicit none
 
   PRIVATE
@@ -639,6 +639,8 @@ contains
 ! 
 
     use LIS_fileIOMod
+    use LIS_constantsMod,  ONLY : radius => LIS_CONST_REARTH, pi => LIS_CONST_PI
+    use getCropIrrigTypes, ONLY : MattA => matt_algorithm
 #if(defined USE_NETCDF3 || defined USE_NETCDF4)
     use netcdf
 #endif
@@ -649,8 +651,11 @@ contains
     integer              :: t,col,row,j
     integer              :: nid,ios,status,itypeId
     integer              :: nirrigtypes, irrigdimid
+    integer              :: nsfctypes,   sfcdimid, lcoverid
     integer              :: countyId, countryId
-    logical              :: file_exists    
+    logical              :: file_exists
+    real,  allocatable   :: l_croptype (:,:,:)
+    real,  allocatable   :: g_croptype (:,:,:),t_croptype(:,:,:)
     real,  allocatable   :: l_itype(:,:,:)
     real,  allocatable   :: glb_itype(:,:,:)
     real,  allocatable   :: l_country(:,:)
@@ -659,10 +664,13 @@ contains
     real,  allocatable   :: glb_county(:,:)
     real,  allocatable   :: temp(:)
     real,  allocatable   :: PREFTYPE(:,:,:)
+    real,  allocatable   :: cell_area (:,:)
     integer              :: iindex
     real                 :: tempval
     integer              :: vegt
     integer              :: ss,ccc
+    type(MattA)          :: MA_global, MA_USA
+    real                 :: d2r, llat
     
 #if (defined USE_NETCDF3 || defined USE_NETCDF4)
 
@@ -693,7 +701,23 @@ contains
        
        ios = nf90_get_var(nid, itypeId, glb_itype)
        call LIS_verify(ios,'nf90_get_var failed for in alltypes_irrigationMod')
-!-- read in country and county fields
+
+       !-- real in LANDCOVER fractions to populate CROPTYPES (lnc,lnc,numbercrops)
+       ios = nf90_inq_dimid(nid, "sfctypes", sfcdimid)
+       call LIS_verify(ios,'nf90_inq_dimid failed for LANDCOVER, NEED new lis_input')
+       ios = nf90_inquire_dimension(nid, sfcdimid, len = nsfctypes)
+       call LIS_verify(ios,'nf90_inquire_dimension failed for LANDCOVER')
+
+       allocate(l_croptype (LIS_rc%lnc(n),LIS_rc%lnr(n),LIS_rc%numbercrops))
+       allocate(g_croptype (LIS_rc%gnc(n),LIS_rc%gnr(n),nsfctypes))
+       allocate(t_croptype (LIS_rc%lnc(n),LIS_rc%lnr(n),nsfctypes))
+       ios = nf90_inq_varid(nid,'LANDCOVER',lcoverId)
+       call LIS_verify(ios,'nf90_inq_varid failed for LANDCOVER')
+
+       ios = nf90_get_var(nid, lcoverId, g_croptype)
+       call LIS_verify(ios,'nf90_get_var failed for in alltypes_irrigationMod')
+       
+       !-- read in country and county fields       
        allocate(glb_country(LIS_rc%gnc(n),LIS_rc%gnr(n)))
        allocate(glb_county(LIS_rc%gnc(n),LIS_rc%gnr(n)))
        allocate(l_country(LIS_rc%lnc(n),LIS_rc%lnr(n)))
@@ -713,6 +737,14 @@ contains
 
        ios = nf90_close(nid)
        call LIS_verify(ios,'nf90_close failed in alltypes_irrigationMod')
+
+       ! Grid to tile mapping CROPTYPES fractions
+       t_croptype (:,:,:) = g_croptype (&
+          LIS_ews_halo_ind(n,LIS_localPet+1):&         
+          LIS_ewe_halo_ind(n,LIS_localPet+1),&
+          LIS_nss_halo_ind(n,LIS_localPet+1):&
+          LIS_nse_halo_ind(n,LIS_localPet+1),:)
+       l_croptype = t_croptype (:,:, nsfctypes - LIS_rc%numbercrops + 1: nsfctypes)
        
        ! Grid to tile mapping index 1=Sprinkler, 2=Drip, 3=Floodg
        ! Note irrigType values are non-missing regardless of croptype or
@@ -726,6 +758,7 @@ contains
        if (irrigtypetocrop .eq. "distribute") then
         print*,'here in distribute'
         allocate(PREFTYPE(LIS_rc%lnc(n),LIS_rc%lnr(n),LIS_rc%nsurfacetypes))
+        PREFTYPE = -1
         l_county(:,:) = glb_county(&
             LIS_ews_halo_ind(n,LIS_localPet+1):&         
             LIS_ewe_halo_ind(n,LIS_localPet+1),&
@@ -740,8 +773,35 @@ contains
          ccc = maxval(l_county)-ss*1000
          print*,'county',maxval(l_county),ss,ccc
 
-        !call get_US_irrigType(l_county,l_itype, PREFTYPE)
-        ! ==> Implement Matt's global country algorithm
+         ! compute LIS grid cell area
+         
+         allocate (cell_area (LIS_rc%lnc(n),LIS_rc%lnr(n)))
+         cell_area = 0.
+         D2R= PI/180.
+         
+         do t=1,LIS_rc%npatch(n,LIS_rc%lsm_index)
+            col = LIS_domain (n)%grid(t)%col
+            row = LIS_domain (n)%grid(t)%row
+            llat= LIS_domain (n)%grid(t)%lat
+            cell_area (col,row) = radius * radius * &
+                 (sin(d2r*(llat + 0.5*LIS_rc%gridDesc(n,10))) - &
+                 sin(d2r*(llat - 0.5*LIS_rc%gridDesc(n,10))))* &
+                 (LIS_rc%gridDesc(n,9)*d2r)/1000./1000.    ! [km2]
+         end do
+
+         ! call MA_global%init_thres (ncrops=LIS_rc%numbercrops,nitypes=nirrigtypes)
+         ! process by country irrigtypes and populate PREFTYPE
+         ! call MA_global%git(LIS_rc%gnc(n),LIS_rc%gnr(n), cell_area,l_country,l_croptype, l_itype, PREFTYPE)
+         ! if ITYPE_MIN_FRAC/CTYPE_AREA_TOL parameters differ between country and US county
+         !    implementation
+         call MA_USA%init_thres (ncrops=LIS_rc%numbercrops,nitypes=nirrigtypes)
+         !     again with an optional argument. 
+         ! rerun with usa option and update PREFTYPE using irrigation fraction vy county
+         !     in the US and overwrite PREFTYPE over the US.
+         call MA_USA%git(LIS_rc%gnc(n),LIS_rc%gnr(n),cell_area, l_county, l_croptype, l_itype, PREFTYPE, usa = .true.)
+
+         deallocate (cell_area)
+
        endif
 
        do t=1,LIS_rc%npatch(n,LIS_rc%lsm_index)
@@ -814,6 +874,7 @@ contains
        deallocate(glb_country)
        deallocate(l_county)
        deallocate(glb_county)
+       deallocate(l_croptype, t_croptype, g_croptype)
        if (allocated(PREFTYPE)) deallocate(PREFTYPE)
     else
        write(LIS_logunit,*) "[ERR] Irrigation type map: ",&
